@@ -1,5 +1,5 @@
 /* Service worker: lets the app open with no signal. Bump VERSION when you change files. */
-var VERSION = 'grocery-v1';
+var VERSION = 'grocery-v2';
 var ASSETS = ['./', './index.html', './styles.css', './app.js', './shared.js', './manifest.webmanifest',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png'];
 

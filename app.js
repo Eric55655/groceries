@@ -20,6 +20,90 @@
   }
 
   var $ = function (sel, root) { return (root || document).querySelector(sel); };
+
+  // ---------------------------------------------------------------- display settings (saved per phone)
+  var THEMES = [
+    { name: 'Green', c: '#1f7a4d' }, { name: 'Blue', c: '#1d5fbf' }, { name: 'Teal', c: '#0f766e' },
+    { name: 'Purple', c: '#6d3fc0' }, { name: 'Pink', c: '#c2306f' }, { name: 'Red', c: '#c0392b' },
+    { name: 'Orange', c: '#d9620f' }, { name: 'Gold', c: '#e0b20b' }, { name: 'Brown', c: '#7a4e2d' },
+    { name: 'Slate', c: '#3f4c5a' }, { name: 'Black', c: '#1b1b1b' }
+  ];
+  var SIZES = [
+    { name: 'Small', v: 0.9 }, { name: 'Normal', v: 1 }, { name: 'Large', v: 1.15 },
+    { name: 'X-Large', v: 1.3 }, { name: 'Huge', v: 1.5 }
+  ];
+  var prefs = load('gl.prefs', { color: '#1f7a4d', mode: 'auto', size: 1 });
+
+  function hexToRgb(h) {
+    h = String(h).replace('#', '');
+    if (h.length === 3) h = h.split('').map(function (x) { return x + x; }).join('');
+    var n = parseInt(h, 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  function mix(hex, withHex, amount) {   // amount 0..1 of withHex
+    var a = hexToRgb(hex), b = hexToRgb(withHex);
+    return '#' + a.map(function (x, i) {
+      return ('0' + Math.round(x + (b[i] - x) * amount).toString(16)).slice(-2);
+    }).join('');
+  }
+  function luminance(hex) {
+    var c = hexToRgb(hex).map(function (v) { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); });
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+  }
+
+  function applyPrefs() {
+    var r = document.documentElement, c = prefs.color || '#1f7a4d';
+    var light = luminance(c) > 0.4;   // light colours (yellow etc.) get dark text
+    r.style.setProperty('--accent', c);
+    r.style.setProperty('--accent-d', mix(c, '#000000', 0.2));
+    r.style.setProperty('--on-accent', light ? '#16181a' : '#ffffff');
+    r.style.setProperty('--on-accent-soft', light ? 'rgba(0,0,0,.1)' : 'rgba(255,255,255,.2)');
+    r.style.setProperty('--accent-tint', mix(c, '#ffffff', 0.88));
+    r.style.setProperty('--accent-tint-dark', mix(c, '#121614', 0.72));
+    r.style.setProperty('--accent-text', light ? mix(c, '#000000', 0.45) : c);
+    r.style.setProperty('--accent-text-dark', mix(c, '#ffffff', 0.45));
+    r.style.setProperty('--accent-bright', light ? mix(c, '#000000', 0.35) : mix(c, '#ffffff', 0.5));
+    r.style.setProperty('--fs', String(prefs.size || 1));
+    if (prefs.mode === 'auto') r.removeAttribute('data-mode'); else r.setAttribute('data-mode', prefs.mode);
+    var meta = document.querySelector('meta[name="theme-color"]'); if (meta) meta.setAttribute('content', c);
+  }
+  applyPrefs();
+
+  function showSettings() {
+    var custom = !THEMES.some(function (t) { return t.c === prefs.color; });
+    openDialog(
+      '<h2>Display settings</h2>' +
+      '<div class="set-label">Color</div><div class="swatches">' +
+      THEMES.map(function (t) {
+        return '<button class="swatch' + (t.c === prefs.color ? ' on' : '') + '" data-color="' + t.c +
+          '" style="background:' + t.c + '" aria-label="' + t.name + '" title="' + t.name + '"></button>';
+      }).join('') +
+      '<label class="swatch custom' + (custom ? ' on' : '') + '" title="Pick any color">' +
+      '<input type="color" id="customColor" value="' + esc(prefs.color) + '" aria-label="Custom color"></label></div>' +
+      '<div class="set-label">Light or dark</div><div class="seg" id="modeSeg">' +
+      [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']].map(function (m) {
+        return '<button data-mode="' + m[0] + '" class="' + (prefs.mode === m[0] ? 'on' : '') + '">' + m[1] + '</button>';
+      }).join('') + '</div>' +
+      '<div class="set-label">Text size</div><div class="seg sizes" id="sizeSeg">' +
+      SIZES.map(function (s) {
+        return '<button data-size="' + s.v + '" class="' + (prefs.size === s.v ? 'on' : '') + '" aria-label="' + s.name + '">' +
+          '<span style="font-size:' + Math.round(15 * s.v) + 'px">A</span><small>' + s.name + '</small></button>';
+      }).join('') + '</div>' +
+      '<div class="sample"><span class="name">Milk <span class="qty">2 gallons</span></span><br><span class="meta">Eric · Pixel 8 · Today 9:41 AM</span></div>' +
+      '<div class="dlg-actions"><button class="btn ghost" id="setReset">Reset</button><span class="grow"></span>' +
+      '<button class="btn primary" data-close>Done</button></div>',
+      function (dlg) {
+        function update(ch) {
+          for (var k in ch) prefs[k] = ch[k];
+          save('gl.prefs', prefs); applyPrefs(); showSettings();
+        }
+        dlg.querySelectorAll('[data-color]').forEach(function (b) { b.onclick = function () { update({ color: b.dataset.color }); }; });
+        $('#customColor', dlg).onchange = function () { update({ color: this.value }); };
+        $('#customColor', dlg).oninput = function () { prefs.color = this.value; applyPrefs(); };
+        dlg.querySelectorAll('[data-mode]').forEach(function (b) { b.onclick = function () { update({ mode: b.dataset.mode }); }; });
+        dlg.querySelectorAll('[data-size]').forEach(function (b) { b.onclick = function () { update({ size: parseFloat(b.dataset.size) }); }; });
+        $('#setReset', dlg).onclick = function () { update({ color: '#1f7a4d', mode: 'auto', size: 1 }); };
+      });
+  }
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
@@ -243,10 +327,12 @@
       (pending ? '<br>' + pending + ' change' + (pending > 1 ? 's' : '') + ' waiting to upload' : '') + '</p>' +
       '<p class="meta"><b>Tips:</b> Type or say several items at once: “2 gallons of milk, eggs and bread”. ' +
       'Tap an item to edit it or change its aisle. Long-press the app icon for “Add by voice”.</p>' +
+      '<button class="btn wide" id="mDisplay">🎨 Display settings (colors &amp; text size)</button>' +
       '<div class="dlg-actions"><button class="btn danger" id="mReset">Disconnect phone</button><span class="grow"></span>' +
       '<button class="btn ghost" id="mSync">Sync now</button><button class="btn primary" data-close>Close</button></div>',
       function (dlg) {
         $('#mSync', dlg).onclick = function () { closeDialog(); sync(); };
+        $('#mDisplay', dlg).onclick = showSettings;
         $('#mReset', dlg).onclick = function () {
           if (S.outbox.length && !confirm(S.outbox.length + ' changes have not uploaded yet and will be lost. Disconnect anyway?')) return;
           closeDialog(); cfg = null; localStorage.removeItem(K.cfg); resetLocal(); render();
@@ -323,6 +409,7 @@
     d.innerHTML = '<div class="dlg">' + html + '</div>';
     d.querySelectorAll('[data-close]').forEach(function (b) { b.onclick = closeDialog; });
     if (wire) wire(d);
+    if (d.open) return;
     if (d.showModal) d.showModal(); else d.setAttribute('open', '');
   }
   function closeDialog() { var d = $('#dialog'); if (d.close) d.close(); else d.removeAttribute('open'); }
@@ -393,14 +480,14 @@
     shellBuilt = true;
     $('#app').innerHTML =
       '<div id="shell">' +
-      '<header class="top"><div class="title"><h1 id="title">Groceries</h1><button id="syncPill" class="pill"></button></div>' +
+      '<div class="stickyhead"><header class="top"><div class="title"><h1 id="title">Groceries</h1><button id="syncPill" class="pill"></button></div>' +
       '<button id="menuBtn" class="icon-btn" aria-label="Menu">⋯</button></header>' +
       '<div id="progress"><div></div></div>' +
-      '<div id="banner"></div>' +
       '<form id="addForm" class="addbar" autocomplete="off">' +
       '<input id="addInput" enterkeyhint="done" placeholder="Add items… e.g. milk, 2 eggs and bread">' +
       '<button type="button" id="micBtn" class="icon-btn mic" aria-label="Add by voice">🎤</button>' +
-      '<button type="submit" class="btn primary">Add</button></form>' +
+      '<button type="submit" class="btn primary">Add</button></form></div>' +
+      '<div id="banner"></div>' +
       '<div id="chips"></div><main id="list"></main><footer id="footer"></footer></div>';
 
     $('#addForm').onsubmit = function (e) {
