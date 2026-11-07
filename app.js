@@ -1,6 +1,7 @@
 /* Grocery List — phone app (works offline; syncs to the Google Sheet backend) */
 (function () {
   'use strict';
+  var APP_VERSION = 3;   // shown in the ⋯ menu so you can confirm a phone has the latest update
 
   // ---------------------------------------------------------------- storage
   var K = { cfg: 'gl.cfg', items: 'gl.items', outbox: 'gl.outbox', trip: 'gl.trip', recent: 'gl.recent',
@@ -323,7 +324,7 @@
     openDialog(
       '<h2>Grocery list</h2>' +
       '<p>This phone: <b>' + esc(me()) + '</b>' + (cfg.device ? ' · ' + esc(cfg.device) : '') + '</p>' +
-      '<p class="meta">Last synced: ' + (S.lastSync ? esc(when(S.lastSync)) : 'never') +
+      '<p class="meta">App version ' + APP_VERSION + ' · Last synced: ' + (S.lastSync ? esc(when(S.lastSync)) : 'never') +
       (pending ? '<br>' + pending + ' change' + (pending > 1 ? 's' : '') + ' waiting to upload' : '') + '</p>' +
       '<p class="meta"><b>Tips:</b> Type or say several items at once: “2 gallons of milk, eggs and bread”. ' +
       'Tap an item to edit it or change its aisle. Long-press the app icon for “Add by voice”.</p>' +
@@ -629,8 +630,22 @@
   window.addEventListener('online', function () { sync(); });
   window.addEventListener('offline', function () { S.error = 'offline'; renderStatus(); });
 
+  // ---------------------------------------------------------------- app updates
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-    navigator.serviceWorker.register('sw.js').catch(function () {});
+    var hadController = !!navigator.serviceWorker.controller, reloading = false;
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(function (reg) {
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible') reg.update().catch(function () {});
+      });
+    }).catch(function () {});
+    // A new version took over: reload now if nothing is in progress, otherwise offer it.
+    navigator.serviceWorker.addEventListener('controllerchange', function () {
+      if (!hadController) { hadController = true; return; }   // first install, not an update
+      if (reloading) return;
+      var busy = ($('#dialog') && $('#dialog').open) || ($('#addInput') && $('#addInput').value) || rec;
+      if (!busy) { reloading = true; location.reload(); }
+      else toast('A new version of the app is ready.', 'Reload', function () { location.reload(); });
+    });
   }
 
   // exposed for testing / debugging in the browser console

@@ -1,10 +1,20 @@
-/* Service worker: lets the app open with no signal. Bump VERSION when you change files. */
-var VERSION = 'grocery-v2';
+/* Service worker: lets the app open with no signal.
+   Strategy: when online, always get the newest files (falls back to the saved copy
+   after 4 seconds or when offline). Bump VERSION whenever you upload changed files. */
+var VERSION = 'grocery-v3';
 var ASSETS = ['./', './index.html', './styles.css', './app.js', './shared.js', './manifest.webmanifest',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png'];
 
 self.addEventListener('install', function (e) {
-  e.waitUntil(caches.open(VERSION).then(function (c) { return c.addAll(ASSETS); }).then(function () { return self.skipWaiting(); }));
+  e.waitUntil(caches.open(VERSION).then(function (cache) {
+    return Promise.all(ASSETS.map(function (u) {
+      // cache: 'reload' skips the browser's HTTP cache so we never save stale files
+      return fetch(u, { cache: 'reload' }).then(function (res) {
+        if (!res.ok) throw new Error('Could not fetch ' + u);
+        return cache.put(u, res);
+      });
+    }));
+  }).then(function () { return self.skipWaiting(); }));
 });
 
 self.addEventListener('activate', function (e) {
@@ -15,16 +25,19 @@ self.addEventListener('activate', function (e) {
 
 self.addEventListener('fetch', function (e) {
   var req = e.request;
-  if (req.method !== 'GET' || new URL(req.url).origin !== self.location.origin) return; // API calls go straight to network
-  // Serve from cache immediately, refresh the cache in the background
+  var url = new URL(req.url);
+  if (req.method !== 'GET' || url.origin !== self.location.origin) return; // API calls go straight to network
+  var key = req.mode === 'navigate' ? './index.html' : url.pathname;
+
   e.respondWith(caches.open(VERSION).then(function (cache) {
-    var key = req.mode === 'navigate' ? './index.html' : req;
-    return cache.match(key, { ignoreSearch: true }).then(function (hit) {
-      var net = fetch(req).then(function (res) {
-        if (res && res.ok) cache.put(key, res.clone());
-        return res;
-      }).catch(function () { return hit; });
-      return hit || net;
+    var fromCache = function () {
+      return cache.match(key, { ignoreSearch: true }).then(function (hit) { return hit || Response.error(); });
+    };
+    var network = fetch(url.origin + url.pathname, { cache: 'no-cache' }).then(function (res) {
+      if (res && res.ok) cache.put(key, res.clone());
+      return res;
     });
+    var timeout = new Promise(function (_, reject) { setTimeout(function () { reject(new Error('slow')); }, 4000); });
+    return Promise.race([network, timeout]).catch(fromCache);
   }));
 });
