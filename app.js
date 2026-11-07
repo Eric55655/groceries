@@ -1,7 +1,7 @@
 /* Grocery List — phone app (works offline; syncs to the Google Sheet backend) */
 (function () {
   'use strict';
-  var APP_VERSION = 3;   // shown in the ⋯ menu so you can confirm a phone has the latest update
+  var APP_VERSION = 4;   // shown in the ⋯ menu so you can confirm a phone has the latest update
 
   // ---------------------------------------------------------------- storage
   var K = { cfg: 'gl.cfg', items: 'gl.items', outbox: 'gl.outbox', trip: 'gl.trip', recent: 'gl.recent',
