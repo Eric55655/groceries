@@ -1,7 +1,7 @@
 /* Service worker: lets the app open with no signal.
    Strategy: when online, always get the newest files (falls back to the saved copy
    after 4 seconds or when offline). Bump VERSION whenever you upload changed files. */
-var VERSION = 'grocery-v4';
+var VERSION = 'grocery-v5';
 var ASSETS = ['./', './index.html', './styles.css', './app.js', './shared.js', './manifest.webmanifest',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png'];
 
