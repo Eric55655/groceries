@@ -1,7 +1,7 @@
 /* Grocery List — phone app (works offline; syncs to the Google Sheet backend) */
 (function () {
   'use strict';
-  var APP_VERSION = 6;   // shown in the ⋯ menu so you can confirm a phone has the latest update
+  var APP_VERSION = 7;   // shown in the ⋯ menu so you can confirm a phone has the latest update
 
   // ---------------------------------------------------------------- storage
   var K = { cfg: 'gl.cfg', items: 'gl.items', outbox: 'gl.outbox', trip: 'gl.trip', recent: 'gl.recent',
@@ -619,7 +619,14 @@
         }
         return sub;
       }).then(function (sub) {
-        return sub || reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+        if (sub) return sub;
+        var key = b64ToBytes(S.vapidKey);
+        if (key.length !== 65 || key[0] !== 4) throw new Error('The list sent a bad notification key (' + key.length + ' bytes). Update Code.gs and run “Set up sheets”.');
+        var opts = { userVisibleOnly: true, applicationServerKey: key };
+        return reg.pushManager.subscribe(opts).catch(function (err) {   // one retry after a short pause
+          return new Promise(function (r) { setTimeout(r, 1500); }).then(function () { return reg.pushManager.subscribe(opts); })
+            .catch(function () { throw err; });
+        });
       });
     }).then(function (sub) {
       idbSet('cfg', { api: cfg.api, token: cfg.token });
@@ -637,8 +644,45 @@
     return Notification.requestPermission().then(function (p) {
       if (p !== 'granted') { toast('Notifications are blocked. Allow them in your phone’s settings for this app.'); renderBanner(); return false; }
       return subscribePush().then(function () { toast('🔔 Notifications are on.'); renderBanner(); return true; });
-    }).catch(function () { toast('Couldn’t turn on notifications. Try again when you have signal.'); return false; });
+    }).catch(function (err) {
+      var msg = pushErrorText(err);
+      save('gl.pushErr', msg + ' (' + new Date().toLocaleString() + ')');
+      toast('Couldn’t turn on notifications: ' + msg);
+      return false;
+    });
   }
+  function pushErrorText(err) {
+    var raw = ((err && err.name) ? err.name + ': ' : '') + ((err && err.message) || String(err));
+    if (/push service|Registration failed|AbortError/i.test(raw))
+      return 'the phone’s push service refused (' + raw + '). In Chrome, make sure Google Play services is up to date; in Brave, turn on “Use Google services for push messaging”.';
+    if (/applicationServerKey|InvalidAccessError|InvalidCharacterError/i.test(raw)) return 'the notification key from the list is invalid (' + raw + '). Re-run “Set up sheets” and redeploy.';
+    if (/NotAllowedError|permission/i.test(raw)) return 'permission was not given (' + raw + ').';
+    return raw;
+  }
+
+  // Step-by-step check, shown in the Notifications screen
+  function runPushCheck(out) {
+    var lines = [], add = function (ok, t) { lines.push((ok ? '✅ ' : '❌ ') + t); out.innerHTML = lines.map(esc).join('<br>'); };
+    add(true, 'App version ' + APP_VERSION + ' · ' + (navigator.userAgent.match(/(SamsungBrowser|Brave|Firefox|EdgA|OPR|Chrome)\/[\d.]+/) || [''])[0]);
+    if (!pushSupported()) { add(false, 'This browser has no push support' + (isIOS ? ' (iPhone: use the Home Screen app)' : '')); return; }
+    add(Notification.permission === 'granted', 'Permission: ' + Notification.permission);
+    var key = S.vapidKey ? b64ToBytes(S.vapidKey) : [];
+    add(key.length === 65 && key[0] === 4, 'Notification key from the list: ' + (S.vapidKey ? key.length + ' bytes' : 'missing — is Code.gs updated and redeployed?'));
+    navigator.serviceWorker.getRegistration().then(function (reg) {
+      add(!!(reg && reg.active), 'Background worker: ' + (reg ? (reg.active ? 'running' : 'installing') : 'not registered'));
+      if (!reg) return;
+      return reg.pushManager.getSubscription().then(function (sub) {
+        add(!!sub, 'Signed up with push service: ' + (sub ? new URL(sub.endpoint).host : 'no'));
+        add(!!cfg.push, 'List knows this phone wants notifications: ' + (cfg.push ? 'yes' : 'no'));
+        if (!sub && Notification.permission === 'granted' && key.length === 65) {
+          return reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key })
+            .then(function (s2) { add(true, 'Test sign-up worked: ' + new URL(s2.endpoint).host); queue({ op: 'subscribe', sub: { endpoint: s2.endpoint } }); })
+            .catch(function (e) { add(false, 'Test sign-up failed: ' + pushErrorText(e)); });
+        }
+      });
+    }).catch(function (e) { add(false, 'Check failed: ' + e); });
+  }
+
   function disablePush() {
     queue({ op: 'unsubscribe' });
     if (pushSupported()) navigator.serviceWorker.ready.then(function (reg) {
@@ -675,15 +719,23 @@
     var sw = function (k, label) {
       return '<label class="switch-row"><span>' + label + '</span><input type="checkbox" role="switch" data-pref="' + k + '"' + (on(k) ? ' checked' : '') + '></label>';
     };
+    var lastErr = load('gl.pushErr', '');
     openDialog('<h2>🔔 Notifications</h2><p>' + status + '</p>' + button +
+      (lastErr && !(cfg.push && perm === 'granted') ? '<p class="meta err-box">Last error: ' + esc(lastErr) + '</p>' : '') +
       '<div class="dlg-label">Notify me when someone…</div>' +
       sw('n_add', 'adds items') + sw('n_trip', 'starts shopping (“I’m at the store”)') + sw('n_bought', 'checks items off') +
       '<div class="dlg-label">When I tap Shop Now…</div>' +
       sw('announce_trip', 'let everyone know I’m at the store') +
-      '<div class="dlg-actions"><span class="grow"></span><button class="btn primary" data-close>Done</button></div>',
+      '<div id="pushCheckOut" class="meta check-out"></div>' +
+      '<div class="dlg-actions"><button class="btn ghost" id="nCheck">Run a check</button><span class="grow"></span><button class="btn primary" data-close>Done</button></div>',
       function (dlg) {
         var bOn = $('#nOn', dlg), bOff = $('#nOff', dlg);
-        if (bOn) bOn.onclick = function () { save('gl.pushOff', false); enablePush().then(function () { setTimeout(showNotifySettings, 400); }); };
+        $('#nCheck', dlg).onclick = function () { runPushCheck($('#pushCheckOut', dlg)); };
+        if (bOn) bOn.onclick = function () {
+          bOn.textContent = 'Turning on…'; bOn.disabled = true;
+          save('gl.pushOff', false);
+          enablePush().then(function (ok) { if (ok) save('gl.pushErr', ''); setTimeout(showNotifySettings, 300); });
+        };
         if (bOff) bOff.onclick = function () { save('gl.pushOff', true); disablePush(); toast('Notifications are off for this phone.'); showNotifySettings(); };
         dlg.querySelectorAll('[data-pref]').forEach(function (inp) {
           inp.onchange = function () { var o = { op: 'setPrefs' }; o[inp.dataset.pref] = inp.checked; queue(o); };
