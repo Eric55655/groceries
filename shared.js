@@ -82,8 +82,23 @@ var GL_NUM = { a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, 
 
 var GL_UNITS = 'half gallons?|gallons?|lbs?|pounds?|oz|ounces?|bags?|box(?:es)?|cans?|bottles?|jars?|packs?|packages?|pkgs?|loaf|loaves|bunch(?:es)?|cartons?|heads?|quarts?|pints?|liters?|litres?|cases?|rolls?|sticks?|containers?|tubs?|bars?|dozen|blocks?|bricks?|slices?|pieces?|cups?';
 
-function glParseOne(s) {
+// Find a known store name, ignoring case and a leading "the"
+function glMatchStore(name, stores) {
+  var n = glNormalize(name).replace(/^the /, '').replace(/'s$/, '');
+  for (var i = 0; i < (stores || []).length; i++) {
+    var s = glNormalize(stores[i]).replace(/^the /, '');
+    if (s && (s === n || s + 's' === n || s === n + 's')) return stores[i];
+  }
+  return null;
+}
+
+function glParseOne(s, stores) {
   s = String(s || '').replace(/^(?:some|more|a few more|a few)\s+/i, '').trim();
+  var store = null;
+  if (stores && stores.length) {   // "peanuts from Menards", "paper towels at Costco"
+    var sm = s.match(/^(.*\S)\s+(?:from|at|@|for)\s+(?:the\s+)?(.+)$/i);
+    if (sm) { var st = glMatchStore(sm[2], stores); if (st) { store = st; s = sm[1]; } }
+  }
   var re = new RegExp('^(\\d+(?:\\.\\d+)?|half a dozen|half dozen|a dozen|a couple(?: of)?|an?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|dozen)\\s+(?:(' + GL_UNITS + ')\\s+)?(?:of\\s+)?(.+)$', 'i');
   var m = s.match(re), qty = '', item = s;
   if (m) {
@@ -97,10 +112,10 @@ function glParseOne(s) {
     }
   }
   item = item.replace(/^of\s+/i, '').trim();
-  return { item: glTitle(item).slice(0, 100), qty: qty };
+  return { item: glTitle(item).slice(0, 100), qty: qty, stores: store ? [store] : [] };
 }
 
-function glParseItems(text) {
+function glParseItems(text, stores) {
   var t = String(text || '').replace(/\s+/g, ' ').trim();
   t = t.replace(/^(?:hey \w+[, ]+)?(?:please )?(?:can you )?(?:add|put|get|buy|we need|i need)\s+/i, '');
   t = t.replace(/\s+(?:to|on|onto)\s+(?:the |my |our )?(?:grocery |groceries |shopping )?list\s*[.!]?$/i, '');
@@ -113,7 +128,7 @@ function glParseItems(text) {
   return t.split(/\s*(?:,|;|\n|\band\b|\balso\b|\bplus\b)\s*/i)
     .map(function (p) { return p.replace(/\u0001/g, 'and').trim(); })
     .filter(Boolean)
-    .map(glParseOne)
+    .map(function (p) { return glParseOne(p, stores); })
     .filter(function (x) { return x.item; });
 }
 
@@ -134,4 +149,10 @@ function glMergeQty(a, b) {
 
 function glId() {
   return 'i' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// Item store tags are stored as "Costco, Menards"
+function glStoresOf(v) {
+  if (Array.isArray(v)) return v.filter(Boolean);
+  return String(v || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
 }

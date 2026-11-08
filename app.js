@@ -1,11 +1,11 @@
 /* Grocery List — phone app (works offline; syncs to the Google Sheet backend) */
 (function () {
   'use strict';
-  var APP_VERSION = 5;   // shown in the ⋯ menu so you can confirm a phone has the latest update
+  var APP_VERSION = 6;   // shown in the ⋯ menu so you can confirm a phone has the latest update
 
   // ---------------------------------------------------------------- storage
   var K = { cfg: 'gl.cfg', items: 'gl.items', outbox: 'gl.outbox', trip: 'gl.trip', recent: 'gl.recent',
-    learned: 'gl.learned', view: 'gl.view', synced: 'gl.synced' };
+    learned: 'gl.learned', view: 'gl.view', synced: 'gl.synced', stores: 'gl.stores', filter: 'gl.filter', vapid: 'gl.vapid' };
   function load(k, d) { try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } }
   function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
 
@@ -13,11 +13,22 @@
   var S = {
     items: load(K.items, []), outbox: load(K.outbox, []), trip: load(K.trip, null),
     recent: load(K.recent, []), learned: load(K.learned, {}), view: load(K.view, 'list'),
-    lastSync: load(K.synced, null), syncing: false, error: null, alias: {}
+    lastSync: load(K.synced, null), syncing: false, error: null, alias: {},
+    stores: load(K.stores, []), filter: load(K.filter, ''), vapidKey: load(K.vapid, '')
   };
   function persist() {
     save(K.items, S.items); save(K.outbox, S.outbox); save(K.trip, S.trip); save(K.recent, S.recent);
     save(K.learned, S.learned); save(K.view, S.view); save(K.synced, S.lastSync);
+    save(K.stores, S.stores); save(K.filter, S.filter); save(K.vapid, S.vapidKey);
+  }
+  function storeNames() { return S.stores.map(function (s) { return s.name; }); }
+  function findStore(name) {
+    var m = name ? glMatchStore(name, storeNames()) : null;
+    return m ? S.stores.filter(function (s) { return s.name === m; })[0] : null;
+  }
+  function inStore(item, storeName) {   // items with no store tag can be bought anywhere
+    var st = item.stores || [];
+    return !storeName || !st.length || st.indexOf(storeName) >= 0;
   }
 
   var $ = function (sel, root) { return (root || document).querySelector(sel); };
@@ -126,10 +137,12 @@
       if (!cfg || cfg.token !== c.token) { resetLocal(); }
       cfg = c; save(K.cfg, cfg);
       history.replaceState(null, '', location.pathname + location.search);
+      setTimeout(function () { idbSet('cfg', { api: cfg.api, token: cfg.token }); }, 0);
     }
   })();
   function resetLocal() {
     S.items = []; S.outbox = []; S.trip = null; S.recent = []; S.learned = {}; S.view = 'list'; S.lastSync = null;
+    S.stores = []; S.filter = '';
     persist();
   }
 
@@ -155,7 +168,7 @@
         var key = glKey(op.item);
         var dup = S.items.filter(function (i) { return i.status === 'open' && glKey(i.item) === key; })[0];
         if (dup) { dup.qty = glMergeQty(dup.qty, op.qty); S.alias[op.id] = dup.id; return; }
-        S.items.push({ id: op.id, item: glTitle(op.item), qty: op.qty || '', notes: op.notes || '',
+        S.items.push({ id: op.id, item: glTitle(op.item), qty: op.qty || '', notes: op.notes || '', stores: op.stores || [],
           category: glCategorize(op.item, S.learned), status: 'open', added_by: me(),
           added_device: (cfg && cfg.device) || '', added_at: op.at, pending: true });
         return;
@@ -165,6 +178,7 @@
         if (op.item != null && String(op.item).trim()) it.item = glTitle(op.item);
         if (op.qty != null) it.qty = op.qty;
         if (op.notes != null) it.notes = op.notes;
+        if (op.stores != null) it.stores = op.stores;
         if (op.category) { it.category = op.category; S.learned[glKey(it.item)] = op.category; }
         return;
       case 'delete':
@@ -177,8 +191,37 @@
         else { it.status = 'open'; it.bought_by = ''; it.bought_at = ''; it.trip_id = ''; }
         return;
       case 'startTrip':
-        if (!S.trip) S.trip = { trip_id: op.tripId, started_by: me(), started_device: (cfg && cfg.device) || '', started_at: op.at };
+        if (!S.trip) S.trip = { trip_id: op.tripId, started_by: me(), started_device: (cfg && cfg.device) || '', started_at: op.at, store: op.store || '' };
         return;
+      case 'addStore':
+        if (op.name && !findStore(op.name)) S.stores.push({ name: glTitle(op.name), learn: true, catRank: {}, itemRank: {}, trips: 0 });
+        return;
+      case 'renameStore': {
+        var rs = findStore(op.from); if (!rs || !op.to) return;
+        var old = rs.name; rs.name = glTitle(op.to);
+        S.items.forEach(function (i) { i.stores = (i.stores || []).map(function (x) { return x === old ? rs.name : x; }); });
+        if (S.filter === old) S.filter = rs.name;
+        return;
+      }
+      case 'deleteStore': {
+        var ds = findStore(op.name); if (!ds) return;
+        S.stores = S.stores.filter(function (x) { return x !== ds; });
+        S.items.forEach(function (i) { i.stores = (i.stores || []).filter(function (x) { return x !== ds.name; }); });
+        if (S.filter === ds.name) S.filter = '';
+        return;
+      }
+      case 'setStoreOrder': {
+        var os = findStore(op.name); if (!os) return;
+        os.catRank = {}; op.order.forEach(function (c, i) { os.catRank[c] = i; });
+        return;
+      }
+      case 'setStoreLearn': { var ls = findStore(op.name); if (ls) ls.learn = !!op.learn; return; }
+      case 'setPrefs':
+        cfg.prefs = cfg.prefs || {};
+        ['n_add', 'n_bought', 'n_trip', 'announce_trip'].forEach(function (k) { if (op[k] != null) cfg.prefs[k] = !!op[k]; });
+        return;
+      case 'subscribe': cfg.push = true; return;
+      case 'unsubscribe': cfg.push = false; return;
       case 'finishTrip':
         S.items = S.items.filter(function (i) { return i.status !== 'bought'; });
         S.trip = null;
@@ -213,7 +256,11 @@
         throw new Error((res && res.message) || 'Server error');
       }
       S.outbox.splice(0, sending.length);
-      if (res.who) { cfg.person = res.who.person; cfg.device = res.who.device; save(K.cfg, cfg); }
+      if (res.who) {
+        cfg.person = res.who.person; cfg.device = res.who.device;
+        if (res.who.prefs) cfg.prefs = res.who.prefs;
+        cfg.push = !!res.who.push; save(K.cfg, cfg);
+      }
       applySnapshot(res.snapshot);
       S.lastSync = new Date().toISOString();
       S.error = null;
@@ -234,8 +281,13 @@
     S.trip = snap.activeTrip || null;
     S.recent = snap.recent || [];
     S.learned = snap.learned || {};
+    S.stores = snap.stores || S.stores;
+    if (snap.vapidKey) S.vapidKey = snap.vapidKey;
+    if (S.filter && !findStore(S.filter)) S.filter = '';
     S.alias = {};
     S.outbox.forEach(applyLocal);   // re-apply changes the server hasn't seen yet
+    if (cfg.prefs) S.outbox.forEach(function (op) { if (op.op === 'setPrefs') applyLocal(op); });
+    autoResubscribe();
     if (wasShopping && !S.trip) {
       S.view = 'list';
       toast('The shopping trip was finished on another phone.');
@@ -244,11 +296,12 @@
 
   // ---------------------------------------------------------------- actions
   function addFromText(text) {
-    var parsed = glParseItems(text);
+    var parsed = glParseItems(text, storeNames());
     if (!parsed.length) return;
     var ids = parsed.map(function (p) {
       var id = glId();
-      queue({ op: 'add', id: id, item: p.item, qty: p.qty });
+      var stores = p.stores.length ? p.stores : (S.view === 'list' && S.filter ? [S.filter] : []);
+      queue({ op: 'add', id: id, item: p.item, qty: p.qty, stores: stores });
       return id;
     });
     toast('Added ' + parsed.map(function (p) { return p.item.toLowerCase(); }).join(', '), 'Undo', function () {
@@ -256,16 +309,36 @@
     });
   }
 
-  function enterShop() {
-    if (!S.items.some(function (i) { return i.status === 'open'; }) && !S.trip) { toast('The list is empty.'); return; }
-    if (!S.trip) queue({ op: 'startTrip', tripId: 'T' + glId() });
+  function enterShop(storeName) {
+    var open = S.items.filter(function (i) { return i.status === 'open'; });
+    if (!open.length && !S.trip) { toast('The list is empty.'); return; }
+    if (!S.trip) {
+      if (storeName == null && S.stores.length > 1) return pickStore(open);
+      if (storeName == null) storeName = S.stores[0] ? S.stores[0].name : '';
+      queue({ op: 'startTrip', tripId: 'T' + glId(), store: storeName });
+    }
     S.view = 'shop'; persist(); render(); window.scrollTo(0, 0); keepAwake(true);
+  }
+  function pickStore(open) {
+    openDialog('<h2>Where are you shopping?</h2><div class="store-pick">' +
+      S.stores.map(function (st) {
+        var n = open.filter(function (i) { return inStore(i, st.name); }).length;
+        return '<button class="btn wide" data-store="' + esc(st.name) + '"><b>' + esc(st.name) + '</b><small>' + n + ' item' + (n === 1 ? '' : 's') + '</small></button>';
+      }).join('') + '</div>' +
+      '<p class="meta">Everyone else gets a “' + esc(me()) + ' is shopping” alert' + (cfg.prefs && cfg.prefs.announce_trip === false ? ' — <b>turned off</b> in 🔔 Notifications' : '') + '.</p>' +
+      '<div class="dlg-actions"><span class="grow"></span><button class="btn ghost" data-close>Cancel</button></div>',
+      function (dlg) {
+        dlg.querySelectorAll('[data-store]').forEach(function (b) {
+          b.onclick = function () { closeDialog(); enterShop(b.getAttribute('data-store')); };
+        });
+      });
   }
   function leaveShop() { S.view = 'list'; persist(); render(); keepAwake(false); }
 
   function finishTrip() {
+    var here = S.trip ? S.trip.store : '';
     var bought = S.items.filter(function (i) { return i.status === 'bought'; }).length;
-    var left = S.items.filter(function (i) { return i.status === 'open'; }).length;
+    var left = S.items.filter(function (i) { return i.status === 'open' && inStore(i, here); }).length;
     openDialog(
       '<h2>Finish shopping?</h2>' +
       '<p>' + bought + ' bought.' + (left ? ' <b>' + left + ' not bought</b> will stay on the list for next time.' : ' Everything was bought!') + '</p>' +
@@ -292,6 +365,11 @@
       '<label>Quantity<input id="eQty" value="' + esc(it.qty) + '" placeholder="e.g. 2, 1 gallon" autocomplete="off"></label>' +
       '<label>Notes<input id="eNotes" value="' + esc(it.notes) + '" placeholder="brand, size…" autocomplete="off"></label>' +
       '<label>Aisle / category<select id="eCat">' + opts + '</select></label>' +
+      (S.stores.length > 1 ? '<div class="dlg-label">Where to buy it <small>(none = any store)</small></div><div class="store-tags">' +
+        S.stores.map(function (st) {
+          return '<label class="tag-check"><input type="checkbox" value="' + esc(st.name) + '"' +
+            ((it.stores || []).indexOf(st.name) >= 0 ? ' checked' : '') + '> ' + esc(st.name) + '</label>';
+        }).join('') + '</div>' : '') +
       '<p class="meta">Added by ' + esc(it.added_by) + (it.added_device ? ' · ' + esc(it.added_device) : '') +
       ' · ' + esc(when(it.added_at)) + (it.also_added_by ? '<br>Also added by ' + esc(it.also_added_by) : '') + '</p>' +
       '<div class="dlg-actions"><button class="btn danger" id="eDel">Delete</button><span class="grow"></span>' +
@@ -305,6 +383,8 @@
           if (q !== (it.qty || '')) { ch.qty = q; any = true; }
           if (no !== (it.notes || '')) { ch.notes = no; any = true; }
           if (c !== it.category) { ch.category = c; any = true; }
+          var picked = Array.prototype.map.call(dlg.querySelectorAll('.store-tags input:checked'), function (x) { return x.value; });
+          if (S.stores.length > 1 && picked.join('|') !== (it.stores || []).join('|')) { ch.stores = picked; any = true; }
           closeDialog();
           if (any) queue(ch);
         };
@@ -313,7 +393,7 @@
           closeDialog();
           queue({ op: 'delete', id: it.id });
           toast('Deleted ' + copy.item.toLowerCase(), 'Undo', function () {
-            queue({ op: 'add', id: glId(), item: copy.item, qty: copy.qty, notes: copy.notes });
+            queue({ op: 'add', id: glId(), item: copy.item, qty: copy.qty, notes: copy.notes, stores: copy.stores || [] });
           });
         };
       });
@@ -327,13 +407,17 @@
       '<p class="meta">App version ' + APP_VERSION + ' · Last synced: ' + (S.lastSync ? esc(when(S.lastSync)) : 'never') +
       (pending ? '<br>' + pending + ' change' + (pending > 1 ? 's' : '') + ' waiting to upload' : '') + '</p>' +
       '<p class="meta"><b>Tips:</b> Type or say several items at once: “2 gallons of milk, eggs and bread”. ' +
-      'Tap an item to edit it or change its aisle. Long-press the app icon for “Add by voice”.</p>' +
-      '<button class="btn wide" id="mDisplay">🎨 Display settings (colors &amp; text size)</button>' +
+      'Add “from Costco” to tag a store. Tap an item to edit it. Long-press the app icon for “Add by voice”.</p>' +
+      '<div class="menu-btns"><button class="btn wide" id="mNotify">🔔 Notifications</button>' +
+      '<button class="btn wide" id="mStores">🏬 Stores &amp; aisle order</button>' +
+      '<button class="btn wide" id="mDisplay">🎨 Colors &amp; text size</button></div>' +
       '<div class="dlg-actions"><button class="btn danger" id="mReset">Disconnect phone</button><span class="grow"></span>' +
       '<button class="btn ghost" id="mSync">Sync now</button><button class="btn primary" data-close>Close</button></div>',
       function (dlg) {
         $('#mSync', dlg).onclick = function () { closeDialog(); sync(); };
         $('#mDisplay', dlg).onclick = showSettings;
+        $('#mNotify', dlg).onclick = showNotifySettings;
+        $('#mStores', dlg).onclick = showStores;
         $('#mReset', dlg).onclick = function () {
           if (S.outbox.length && !confirm(S.outbox.length + ' changes have not uploaded yet and will be lost. Disconnect anyway?')) return;
           closeDialog(); cfg = null; localStorage.removeItem(K.cfg); resetLocal(); render();
@@ -435,13 +519,216 @@
     return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
   }
 
+  // ---------------------------------------------------------------- stores manager
+  function showStores() {
+    openDialog('<h2>Stores &amp; aisle order</h2>' +
+      '<p class="meta">Tag items with a store (or say “peanuts from Menards”). Items with no store show up at every store. ' +
+      'Each store keeps its own aisle order, and learns it from the order you check things off.</p>' +
+      '<ul class="store-list">' + S.stores.map(function (st) {
+        return '<li><div><b>' + esc(st.name) + '</b><small>' + (st.learn === false ? 'Learning off' : (st.trips ? 'Learned from ' + st.trips + ' trip' + (st.trips === 1 ? '' : 's') : 'Learns as you shop')) + '</small></div>' +
+          '<button class="btn small" data-aisles="' + esc(st.name) + '">Aisles</button>' +
+          '<button class="btn small ghost" data-rename="' + esc(st.name) + '">Rename</button>' +
+          (S.stores.length > 1 ? '<button class="btn small danger" data-del="' + esc(st.name) + '">✕</button>' : '') + '</li>';
+      }).join('') + '</ul>' +
+      '<form id="newStore" class="row-form"><input id="newStoreName" placeholder="Add a store, e.g. Costco" maxlength="40" autocomplete="off"><button class="btn primary">Add</button></form>' +
+      '<div class="dlg-actions"><span class="grow"></span><button class="btn primary" data-close>Done</button></div>',
+      function (dlg) {
+        $('#newStore', dlg).onsubmit = function (e) {
+          e.preventDefault(); var v = $('#newStoreName', dlg).value.trim(); if (!v) return;
+          if (findStore(v)) { toast(v + ' is already a store.'); return; }
+          queue({ op: 'addStore', name: v }); showStores();
+        };
+        dlg.querySelectorAll('[data-aisles]').forEach(function (b) { b.onclick = function () { showAisles(b.getAttribute('data-aisles')); }; });
+        dlg.querySelectorAll('[data-rename]').forEach(function (b) {
+          b.onclick = function () {
+            var from = b.getAttribute('data-rename');
+            openDialog('<h2>Rename store</h2><label>New name<input id="rnName" value="' + esc(from) + '" maxlength="40"></label>' +
+              '<div class="dlg-actions"><span class="grow"></span><button class="btn ghost" id="rnBack">Back</button><button class="btn primary" id="rnSave">Save</button></div>',
+              function (d2) {
+                $('#rnBack', d2).onclick = showStores;
+                $('#rnSave', d2).onclick = function () {
+                  var to = $('#rnName', d2).value.trim();
+                  if (to && to !== from) { if (findStore(to) && findStore(to).name !== from) { toast(to + ' is already a store.'); return; } queue({ op: 'renameStore', from: from, to: to }); }
+                  showStores();
+                };
+              });
+          };
+        });
+        dlg.querySelectorAll('[data-del]').forEach(function (b) {
+          b.onclick = function () {
+            var name = b.getAttribute('data-del');
+            openDialog('<h2>Delete ' + esc(name) + '?</h2><p>Items tagged only for ' + esc(name) + ' will show at every store instead. Nothing is removed from your list.</p>' +
+              '<div class="dlg-actions"><span class="grow"></span><button class="btn ghost" id="dlBack">Back</button><button class="btn danger" id="dlYes">Delete store</button></div>',
+              function (d2) {
+                $('#dlBack', d2).onclick = showStores;
+                $('#dlYes', d2).onclick = function () { queue({ op: 'deleteStore', name: name }); showStores(); };
+              });
+          };
+        });
+      });
+  }
+
+  function showAisles(name) {
+    var st = findStore(name); if (!st) return showStores();
+    var order = catOrder(name);
+    function draw() {
+      return '<h2>' + esc(st.name) + ' aisle order</h2><p class="meta">Put sections in the order you walk through this store.</p>' +
+        '<ol class="aisles">' + order.map(function (c, i) {
+          return '<li><span>' + esc(c) + '</span><button class="btn small ghost" data-up="' + i + '"' + (i ? '' : ' disabled') + ' aria-label="Move up">▲</button>' +
+            '<button class="btn small ghost" data-down="' + i + '"' + (i < order.length - 1 ? '' : ' disabled') + ' aria-label="Move down">▼</button></li>';
+        }).join('') + '</ol>' +
+        '<label class="switch-row"><span>Learn from the order I check things off</span><input type="checkbox" role="switch" id="learnSw"' + (st.learn === false ? '' : ' checked') + '></label>' +
+        '<div class="dlg-actions"><button class="btn ghost" id="aiReset">Reset</button><span class="grow"></span>' +
+        '<button class="btn ghost" id="aiBack">Back</button><button class="btn primary" id="aiSave">Save</button></div>';
+    }
+    function wire(dlg) {
+      dlg.querySelectorAll('[data-up]').forEach(function (b) { b.onclick = function () { var i = +b.dataset.up; order.splice(i - 1, 0, order.splice(i, 1)[0]); openDialog(draw(), wire); }; });
+      dlg.querySelectorAll('[data-down]').forEach(function (b) { b.onclick = function () { var i = +b.dataset.down; order.splice(i + 1, 0, order.splice(i, 1)[0]); openDialog(draw(), wire); }; });
+      $('#aiReset', dlg).onclick = function () { order = GL_CATEGORIES.slice(); openDialog(draw(), wire); };
+      $('#aiBack', dlg).onclick = showStores;
+      $('#aiSave', dlg).onclick = function () {
+        queue({ op: 'setStoreOrder', name: st.name, order: order });
+        var learn = $('#learnSw', dlg).checked;
+        if (learn !== (st.learn !== false)) queue({ op: 'setStoreLearn', name: st.name, learn: learn });
+        toast(st.name + ' aisle order saved.'); showStores();
+      };
+    }
+    openDialog(draw(), wire);
+  }
+
+  // ---------------------------------------------------------------- notifications
+  var isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  var standalone = window.matchMedia && window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  function pushSupported() { return 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window; }
+  function shouldAskPush() {
+    return cfg && pushSupported() && Notification.permission === 'default' && !load('gl.pushAsked', 0) && S.lastSync && S.vapidKey;
+  }
+  function b64ToBytes(s) {
+    s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '=';
+    var raw = atob(s), out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+  function subscribePush() {
+    return navigator.serviceWorker.ready.then(function (reg) {
+      return reg.pushManager.getSubscription().then(function (sub) {
+        var key = b64ToBytes(S.vapidKey);
+        if (sub && sub.options && sub.options.applicationServerKey) {
+          var cur = new Uint8Array(sub.options.applicationServerKey);
+          if (cur.length !== key.length || cur.some(function (b, i) { return b !== key[i]; })) return sub.unsubscribe().then(function () { return null; });
+        }
+        return sub;
+      }).then(function (sub) {
+        return sub || reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+      });
+    }).then(function (sub) {
+      idbSet('cfg', { api: cfg.api, token: cfg.token });
+      queue({ op: 'subscribe', sub: { endpoint: sub.endpoint } });
+      return true;
+    });
+  }
+  function enablePush() {
+    save('gl.pushAsked', Date.now());
+    if (!pushSupported()) {
+      toast(isIOS && !standalone ? 'On iPhone, add the app to your Home Screen first, then turn on notifications from there.' : 'This browser can’t show notifications.');
+      return Promise.resolve(false);
+    }
+    if (!S.vapidKey) { toast('Connect to the list first, then try again.'); return Promise.resolve(false); }
+    return Notification.requestPermission().then(function (p) {
+      if (p !== 'granted') { toast('Notifications are blocked. Allow them in your phone’s settings for this app.'); renderBanner(); return false; }
+      return subscribePush().then(function () { toast('🔔 Notifications are on.'); renderBanner(); return true; });
+    }).catch(function () { toast('Couldn’t turn on notifications. Try again when you have signal.'); return false; });
+  }
+  function disablePush() {
+    queue({ op: 'unsubscribe' });
+    if (pushSupported()) navigator.serviceWorker.ready.then(function (reg) {
+      return reg.pushManager.getSubscription().then(function (s) { if (s) return s.unsubscribe(); });
+    }).catch(function () {});
+  }
+  var resubTried = false;
+  function autoResubscribe() {   // e.g. after reinstalling: permission is still granted but the server lost the subscription
+    if (resubTried || !cfg || cfg.push || !pushSupported() || Notification.permission !== 'granted' || !S.vapidKey) return;
+    if (S.outbox.some(function (o) { return o.op === 'unsubscribe' || o.op === 'subscribe'; })) return;
+    if (load('gl.pushOff', false)) return;
+    resubTried = true;
+    subscribePush().catch(function () {});
+  }
+
+  function showNotifySettings() {
+    var p = cfg.prefs || {};
+    var on = function (k) { return p[k] !== false; };
+    var perm = pushSupported() ? Notification.permission : 'unsupported';
+    var status, button;
+    if (perm === 'unsupported') {
+      status = isIOS && !standalone ? 'On iPhone, notifications work after you add this app to your Home Screen (Share → Add to Home Screen) and open it from there.' : 'This browser can’t show notifications.';
+      button = '';
+    } else if (perm === 'denied') {
+      status = '⛔ Notifications are blocked for this app. Allow them in your phone’s settings (Settings → Apps / Notifications), then come back here.';
+      button = '';
+    } else if (cfg.push && perm === 'granted') {
+      status = '✅ On for this phone.';
+      button = '<button class="btn ghost" id="nOff">Turn off on this phone</button>';
+    } else {
+      status = 'Off for this phone.';
+      button = '<button class="btn primary" id="nOn">Turn on notifications</button>';
+    }
+    var sw = function (k, label) {
+      return '<label class="switch-row"><span>' + label + '</span><input type="checkbox" role="switch" data-pref="' + k + '"' + (on(k) ? ' checked' : '') + '></label>';
+    };
+    openDialog('<h2>🔔 Notifications</h2><p>' + status + '</p>' + button +
+      '<div class="dlg-label">Notify me when someone…</div>' +
+      sw('n_add', 'adds items') + sw('n_trip', 'starts shopping (“I’m at the store”)') + sw('n_bought', 'checks items off') +
+      '<div class="dlg-label">When I tap Shop Now…</div>' +
+      sw('announce_trip', 'let everyone know I’m at the store') +
+      '<div class="dlg-actions"><span class="grow"></span><button class="btn primary" data-close>Done</button></div>',
+      function (dlg) {
+        var bOn = $('#nOn', dlg), bOff = $('#nOff', dlg);
+        if (bOn) bOn.onclick = function () { save('gl.pushOff', false); enablePush().then(function () { setTimeout(showNotifySettings, 400); }); };
+        if (bOff) bOff.onclick = function () { save('gl.pushOff', true); disablePush(); toast('Notifications are off for this phone.'); showNotifySettings(); };
+        dlg.querySelectorAll('[data-pref]').forEach(function (inp) {
+          inp.onchange = function () { var o = { op: 'setPrefs' }; o[inp.dataset.pref] = inp.checked; queue(o); };
+        });
+      });
+  }
+
+  // tiny IndexedDB key/value store, shared with the service worker
+  function idb() {
+    return new Promise(function (res, rej) {
+      if (!window.indexedDB) return rej(new Error('no idb'));
+      var r = indexedDB.open('grocery', 1);
+      r.onupgradeneeded = function () { r.result.createObjectStore('kv'); };
+      r.onsuccess = function () { res(r.result); }; r.onerror = function () { rej(r.error); };
+    });
+  }
+  function idbSet(k, v) {
+    return idb().then(function (db) {
+      return new Promise(function (res) { var tx = db.transaction('kv', 'readwrite'); tx.objectStore('kv').put(v, k); tx.oncomplete = res; tx.onerror = res; });
+    }).catch(function () {});
+  }
+  function markSeen() {   // notifications summarize what happened since you last looked at the app
+    if (document.visibilityState !== 'visible') return;
+    idbSet('seenAt', new Date().toISOString());
+    if ('serviceWorker' in navigator && navigator.serviceWorker.getRegistration) {
+      navigator.serviceWorker.getRegistration().then(function (reg) {
+        if (reg && reg.getNotifications) reg.getNotifications({ tag: 'grocery' }).then(function (ns) { ns.forEach(function (n) { n.close(); }); });
+      }).catch(function () {});
+    }
+  }
+
   // ---------------------------------------------------------------- rendering
-  function groups(items) {
+  function catOrder(storeName) {
+    var st = findStore(storeName), rank = (st && st.catRank) || {};
+    var r = function (c) { var i = GL_CATEGORIES.indexOf(c); return rank[c] != null ? rank[c] : (i < 0 ? 99 : i); };
+    return GL_CATEGORIES.slice().sort(function (a, b) { return r(a) - r(b); });
+  }
+  function groups(items, storeName) {
     var by = {};
     items.forEach(function (i) { var c = i.category || 'Other'; (by[c] = by[c] || []).push(i); });
-    var order = GL_CATEGORIES.concat(Object.keys(by).filter(function (c) { return GL_CATEGORIES.indexOf(c) < 0; }));
+    var order = catOrder(storeName).concat(Object.keys(by).filter(function (c) { return GL_CATEGORIES.indexOf(c) < 0; }));
+    var st = findStore(storeName), ir = (st && st.itemRank) || {};
+    var rk = function (i) { var v = ir[glKey(i.item)]; return v == null ? 1e9 : v; };
     return order.filter(function (c) { return by[c]; }).map(function (c) {
-      return { cat: c, items: by[c].sort(function (a, b) { return a.item.localeCompare(b.item); }) };
+      return { cat: c, items: by[c].sort(function (a, b) { return rk(a) - rk(b) || a.item.localeCompare(b.item); }) };
     });
   }
 
@@ -449,7 +736,9 @@
     if (!cfg || S.error === 'unauthorized') return renderSetup();
     ensureShell();
     document.body.classList.toggle('shopping', S.view === 'shop');
-    renderStatus(); renderBanner(); renderChips(); renderList(); renderFooter();
+    renderStatus(); renderBanner(); renderStoreChips(); renderChips(); renderList(); renderFooter();
+    var inp = $('#addInput');
+    if (inp) inp.placeholder = S.view === 'list' && S.filter ? 'Add to ' + S.filter + '…' : 'Add items… e.g. milk, 2 eggs and bread';
   }
 
   function renderSetup() {
@@ -489,7 +778,7 @@
       '<button type="button" id="micBtn" class="icon-btn mic" aria-label="Add by voice">🎤</button>' +
       '<button type="submit" class="btn primary">Add</button></form></div>' +
       '<div id="banner"></div>' +
-      '<div id="chips"></div><main id="list"></main><footer id="footer"></footer></div>';
+      '<div id="storeChips"></div><div id="chips"></div><main id="list"></main><footer id="footer"></footer></div>';
 
     $('#addForm').onsubmit = function (e) {
       e.preventDefault();
@@ -509,6 +798,10 @@
         if (navigator.vibrate) navigator.vibrate(15);
         queue({ op: 'check', id: it.id, bought: it.status !== 'bought' });
       }
+    };
+    $('#storeChips').onclick = function (e) {
+      var b = e.target.closest('[data-filter]'); if (!b) return;
+      S.filter = b.getAttribute('data-filter'); persist(); render();
     };
     $('#chips').onclick = function (e) {
       var b = e.target.closest('[data-name]'); if (b) addFromText(b.getAttribute('data-name'));
@@ -530,10 +823,28 @@
     var b = $('#banner');
     if (S.view === 'list' && S.trip) {
       var mine = S.trip.started_by === me();
-      b.innerHTML = '<div class="banner"><span>🛒 ' + (mine ? 'Your shopping trip is still open' : esc(S.trip.started_by) + ' is shopping now') +
+      var at = S.trip.store ? ' at ' + esc(S.trip.store) : '';
+      b.innerHTML = '<div class="banner"><span>🛒 ' + (mine ? 'Your shopping trip' + at + ' is still open' : esc(S.trip.started_by) + ' is shopping' + at + ' now') +
         '</span><button class="btn small" id="joinTrip">' + (mine ? 'Resume' : 'Join') + '</button></div>';
-      $('#joinTrip').onclick = enterShop;
+      $('#joinTrip').onclick = function () { enterShop(); };
+    } else if (S.view === 'list' && shouldAskPush()) {
+      b.innerHTML = '<div class="banner"><span>🔔 Get an alert when family adds items or goes shopping</span>' +
+        '<button class="btn small ghost" id="pushLater">Not now</button><button class="btn small primary" id="pushOn">Turn on</button></div>';
+      $('#pushOn').onclick = function () { enablePush(); };
+      $('#pushLater').onclick = function () { save('gl.pushAsked', Date.now()); renderBanner(); };
     } else b.innerHTML = '';
+  }
+
+  function renderStoreChips() {
+    var c = $('#storeChips');
+    if (S.view !== 'list' || S.stores.length < 2) { c.innerHTML = ''; return; }
+    var open = S.items.filter(function (i) { return i.status === 'open'; });
+    var chip = function (val, label, n) {
+      return '<button class="schip' + (S.filter === val ? ' on' : '') + '" data-filter="' + esc(val) + '">' + esc(label) + ' <span>' + n + '</span></button>';
+    };
+    c.innerHTML = chip('', 'All stores', open.length) + S.stores.map(function (st) {
+      return chip(st.name, st.name, open.filter(function (i) { return inStore(i, st.name); }).length);
+    }).join('');
   }
 
   function renderChips() {
@@ -554,11 +865,13 @@
     var title = $('#title'), bar = $('#progress');
 
     if (S.view === 'shop') {
+      var here = S.trip ? S.trip.store : '';
+      open = open.filter(function (i) { return inStore(i, here); });
       var total = open.length + bought.length;
-      title.textContent = 'Shopping · ' + bought.length + ' of ' + total;
+      title.textContent = (here && S.stores.length > 1 ? here : 'Shopping') + ' · ' + bought.length + ' of ' + total;
       bar.style.display = 'block';
       bar.firstChild.style.width = (total ? Math.round(100 * bought.length / total) : 0) + '%';
-      var html = groups(open).map(function (g) {
+      var html = groups(open, here).map(function (g) {
         return '<section class="group"><h2>' + esc(g.cat) + '</h2><ul>' + g.items.map(checkRow).join('') + '</ul></section>';
       }).join('');
       if (!open.length) html += '<div class="empty">🎉 Everything is in the cart.</div>';
@@ -573,17 +886,20 @@
 
     title.textContent = 'Groceries';
     bar.style.display = 'none';
+    if (S.filter) open = open.filter(function (i) { return inStore(i, S.filter); });
     if (!open.length) {
-      el.innerHTML = '<div class="empty">The list is empty.<br><small>Add something above or tap 🎤 to say it.</small></div>';
+      el.innerHTML = '<div class="empty">' + (S.filter ? 'Nothing to get at ' + esc(S.filter) + '.' : 'The list is empty.') +
+        '<br><small>Add something above or tap 🎤 to say it.</small></div>';
       return;
     }
-    el.innerHTML = groups(open).map(function (g) {
+    el.innerHTML = groups(open, S.filter).map(function (g) {
       return '<section class="group"><h2>' + esc(g.cat) + ' <span class="count">' + g.items.length + '</span></h2><ul>' +
         g.items.map(function (i) {
           return '<li data-id="' + esc(i.id) + '"><button class="row" data-act="edit">' +
             '<span class="name">' + esc(i.item) + (i.qty ? ' <span class="qty">' + esc(i.qty) + '</span>' : '') +
             (i.pending ? ' <span class="dot" title="Not uploaded yet"></span>' : '') + '</span>' +
             (i.notes ? '<span class="notes">' + esc(i.notes) + '</span>' : '') +
+            ((i.stores || []).length && S.stores.length > 1 ? '<span class="stags">' + i.stores.map(function (x) { return '<span>🏬 ' + esc(x) + '</span>'; }).join('') + '</span>' : '') +
             '<span class="meta">' + esc(i.added_by) + (i.added_device ? ' · ' + esc(i.added_device) : '') + ' · ' + esc(when(i.added_at)) + '</span>' +
             '</button></li>';
         }).join('') + '</ul></section>';
@@ -609,7 +925,7 @@
     } else {
       f.innerHTML = '<button class="btn primary big wide" id="shopBtn"' + (openCount || S.trip ? '' : ' disabled') + '>🛒 ' +
         (S.trip ? 'Resume shopping' : 'Shop Now') + (openCount ? ' (' + openCount + ')' : '') + '</button>';
-      $('#shopBtn').onclick = enterShop;
+      $('#shopBtn').onclick = function () { enterShop(); };
     }
   }
 
@@ -619,13 +935,19 @@
 
   var params = new URLSearchParams(location.search);
   if (cfg && params.get('voice')) showVoiceOverlay();
-  if (cfg && params.get('shop')) setTimeout(enterShop, 300);
-  if (params.get('voice') || params.get('shop')) history.replaceState(null, '', location.pathname);
+  if (cfg && params.get('shop')) setTimeout(function () { enterShop(); }, 300);
+  var shared = [params.get('share_title'), params.get('share_text')].filter(Boolean).join('\n');
+  if (cfg && shared) setTimeout(function () { addFromText(shared); }, 300);   // shared from another app
+  if (params.toString()) history.replaceState(null, '', location.pathname);
+  if (cfg) { idbSet('cfg', { api: cfg.api, token: cfg.token }); markSeen(); }
   if (S.view === 'shop') keepAwake(true);
 
   setInterval(function () { if (cfg && document.visibilityState === 'visible') sync(); }, 20000);
   document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState === 'visible' && cfg) { sync(); if (S.view === 'shop') keepAwake(true); }
+    if (document.visibilityState === 'visible' && cfg) { sync(); markSeen(); if (S.view === 'shop') keepAwake(true); }
+  });
+  if ('serviceWorker' in navigator) navigator.serviceWorker.addEventListener('message', function (e) {
+    if (e.data && e.data.type === 'sync') { sync(); markSeen(); }
   });
   window.addEventListener('online', function () { sync(); });
   window.addEventListener('offline', function () { S.error = 'offline'; renderStatus(); });
